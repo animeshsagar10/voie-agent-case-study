@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# PDF case study
+*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# uv / venv
+.venv/
