@@ -6,6 +6,7 @@ import statistics
 import anthropic
 from dotenv import load_dotenv
 
+import store
 from models import (
     EvaluationContext,
     EvaluationResult,
@@ -15,6 +16,12 @@ from models import (
     ImproveResult,
     CalibrationResult,
 )
+
+try:
+    from langdetect import detect as _lang_detect, LangDetectException as _LangDetectException
+    _LANGDETECT_AVAILABLE = True
+except ImportError:
+    _LANGDETECT_AVAILABLE = False
 
 load_dotenv()
 
@@ -92,12 +99,20 @@ def _detect_flags(response: str) -> list[str]:
     flags = []
     if not response or not response.strip():
         flags.append("empty_response")
+        return flags  # no point running further checks on empty input
     if len(response) > 500:
         flags.append("response_too_long_for_voice")
+    if _LANGDETECT_AVAILABLE:
+        try:
+            lang = _lang_detect(response)
+            if lang != "en":
+                flags.append(f"non_english_response:{lang}")
+        except _LangDetectException:
+            pass  # too short / ambiguous to detect reliably
     return flags
 
 
-def evaluate_response(context: EvaluationContext, response: str) -> EvaluationResult:
+def evaluate_response(context: EvaluationContext, response: str, metadata=None) -> EvaluationResult:
     key = _cache_key(context.current_directive, context.user_input, response)
 
     if key in _cache:
@@ -144,13 +159,15 @@ Return this exact JSON:
         "suggestions": data.get("suggestions", []),
     }
 
-    return EvaluationResult(
+    result = EvaluationResult(
         overall_score=overall,
         dimensions={k: DimensionScore(**v) for k, v in data["dimensions"].items()},
         flags=all_flags,
         suggestions=data.get("suggestions", []),
         cached=False,
     )
+    store.save(result, metadata=metadata, response_hash=key)
+    return result
 
 
 def compare_responses(

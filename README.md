@@ -1,53 +1,107 @@
 # LLM Response Quality Evaluator
 
+![System Architecture](LLM_Voice_Eval_Workflow.png)
+
 Automated multi-dimensional evaluation of voice AI responses using the **LLM-as-Judge** pattern. Built for BloomingHealth's voice AI platform to replace manual call quality review.
+
+Evaluations are scored across 6 healthcare-relevant dimensions, persisted to SQLite for trend analysis, and aggregatable by agent, prompt version, or call purpose.
+
+---
 
 ## Setup
 
-**Requirements:** Python 3.11+, [uv](https://docs.astral.sh/uv/)
+**Option A — uv (recommended, fastest):** Python 3.11+, [uv](https://docs.astral.sh/uv/)
 
 ```bash
-# Install uv if you don't have it
+# 1. Install uv (skip if already installed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Install dependencies
+# 2. Install dependencies
 uv sync
 
-# Add your Anthropic API key and optionally select the judge model
-echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
-echo "JUDGE_MODEL=claude-sonnet-4-6" >> .env   # default; swap to claude-haiku-4-5-20251001 for dev
+# 3. Configure environment
+cp .env.example .env
+# Open .env and add your ANTHROPIC_API_KEY
 
-# Start the server
+# 4. Start the server
 uv run python main.py
+# → API live at http://localhost:8000
+# → Interactive docs at http://localhost:8000/docs
 ```
 
-API is now live at `http://localhost:8000`. Interactive docs at `http://localhost:8000/docs`.
+**Option B — pip:**
+
+```bash
+pip install anthropic fastapi uvicorn python-dotenv pydantic httpx langdetect
+
+cp .env.example .env
+# Open .env and add your ANTHROPIC_API_KEY
+
+python main.py
+```
+
+**`.env` options:**
+```bash
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Model selection — pick one:
+JUDGE_MODEL=claude-haiku-4-5-20251001   # development: fast (~4s), cheap (~$0.50/1k evals)
+JUDGE_MODEL=claude-sonnet-4-6           # production: best discrimination gap (default)
+JUDGE_MODEL=claude-opus-4-6             # clinical: perfect calibration (std_dev=0.00)
+```
+
+**SQLite:** `evaluations.db` is created automatically in the project directory on the first `/api/evaluate` call. No configuration or migration needed. It is gitignored.
+
+---
 
 ## Run Tests
 
 ```bash
+# uv
 uv sync --extra dev
 uv run pytest tests/ -v
+
+# pip
+pip install pytest pytest-asyncio
+pytest tests/ -v
 ```
 
-All 11 tests pass, covering evaluation, caching, batch processing, A/B comparison, improvement, and edge cases.
+14 tests covering: evaluation, caching, batch processing, A/B comparison, improvement, edge cases (empty, long, non-English), SQLite persistence, and pattern analysis.
 
 ---
 
 ## API Endpoints
 
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/evaluate` | POST | Score a single response across 6 dimensions |
+| `/api/evaluate/batch` | POST | Score multiple responses + aggregate statistics |
+| `/api/compare` | POST | A/B comparison of two responses to the same context |
+| `/api/improve` | POST | Generate an improved version and score both |
+| `/api/evaluate/calibrate` | POST | Measure scoring consistency across N independent runs |
+| `/api/analysis/patterns` | GET | Aggregated score trends by agent, prompt version, or call purpose |
+| `/health` | GET | Health check |
+
+---
+
 ### `POST /api/evaluate`
-Scores a single response across 6 dimensions (1–10 scale).
+
+Scores a single response. Pass optional `metadata` to tag evaluations for pattern analysis.
 
 ```bash
 curl -X POST http://localhost:8000/api/evaluate \
   -H "Content-Type: application/json" \
   -d '{
     "context": {
-      "current_directive": "Ask about food security",
+      "current_directive": "Ask about food security using USDA screening questions",
       "user_input": "We sometimes run out of food before the end of the month"
     },
-    "response": "I understand that can be really challenging. Would you say that happens often, sometimes, or rarely?"
+    "response": "I understand that can be really challenging. Would you say that happens often, sometimes, or rarely?",
+    "metadata": {
+      "agent_id": "food_security_agent",
+      "prompt_version": "v2.1",
+      "call_purpose": "sdoh_screening"
+    }
   }'
 ```
 
@@ -59,9 +113,9 @@ curl -X POST http://localhost:8000/api/evaluate \
     "task_completion": { "score": 9, "reasoning": "Successfully asked clarifying question" },
     "empathy":         { "score": 8, "reasoning": "Acknowledged difficulty appropriately" },
     "conciseness":     { "score": 9, "reasoning": "Brief and focused" },
-    "naturalness":     { "score": 8, "reasoning": "Conversational tone" },
+    "naturalness":     { "score": 8, "reasoning": "Conversational tone for voice" },
     "safety":          { "score": 10, "reasoning": "No harmful content" },
-    "clarity":         { "score": 8, "reasoning": "Clear and easy to follow" }
+    "clarity":         { "score": 8, "reasoning": "Clear when spoken aloud" }
   },
   "flags": [],
   "suggestions": ["Consider warmer acknowledgment before the clarifying question"],
@@ -69,36 +123,76 @@ curl -X POST http://localhost:8000/api/evaluate \
 }
 ```
 
+**Automatic flags (detected before the LLM call):**
+
+| Flag | Trigger |
+|---|---|
+| `empty_response` | Response is blank |
+| `response_too_long_for_voice` | Response exceeds 500 characters (~30s to speak) |
+| `non_english_response:<lang>` | Non-English content detected (e.g. `non_english_response:es`) |
+
 ---
 
 ### `POST /api/evaluate/batch`
-Evaluates multiple responses and returns aggregate statistics.
+
+Evaluates multiple responses in one call and returns individual scores plus aggregate statistics.
 
 ```bash
 curl -X POST http://localhost:8000/api/evaluate/batch \
   -H "Content-Type: application/json" \
   -d '{
     "evaluations": [
-      { "context": { "current_directive": "...", "user_input": "..." }, "response": "Response A" },
-      { "context": { "current_directive": "...", "user_input": "..." }, "response": "Response B" }
+      {
+        "context": { "current_directive": "Verify date of birth", "user_input": "March 15th, 1985" },
+        "response": "Got it, March 15th, 1985. Thank you for confirming.",
+        "metadata": { "agent_id": "intake_agent", "prompt_version": "v1" }
+      },
+      {
+        "context": { "current_directive": "Verify date of birth", "user_input": "March 15th, 1985" },
+        "response": "Perfect! I have recorded your date of birth as March 15th, 1985. Is there anything else I can help you with today?",
+        "metadata": { "agent_id": "intake_agent", "prompt_version": "v2" }
+      }
     ]
   }'
 ```
 
-Returns individual scores + `aggregate` with `mean_overall`, `min/max`, and per-dimension means.
+**Response:**
+```json
+{
+  "results": [ { "overall_score": 8.3, ... }, { "overall_score": 7.7, ... } ],
+  "aggregate": {
+    "count": 2,
+    "mean_overall": 8.0,
+    "min_overall": 7.7,
+    "max_overall": 8.3,
+    "dimension_means": {
+      "task_completion": 8.5,
+      "empathy": 7.0,
+      "conciseness": 8.0,
+      "naturalness": 8.5,
+      "safety": 9.5,
+      "clarity": 8.5
+    }
+  }
+}
+```
 
 ---
 
 ### `POST /api/compare`
-A/B comparison of two responses to the same context.
+
+A/B comparison of two responses to the same context. Uses a single LLM call for consistent relative judgment.
 
 ```bash
 curl -X POST http://localhost:8000/api/compare \
   -H "Content-Type: application/json" \
   -d '{
-    "context": { "current_directive": "Verify date of birth", "user_input": "March 15, 1985" },
+    "context": {
+      "current_directive": "Verify date of birth",
+      "user_input": "March 15th, 1985"
+    },
     "response_a": "Got it, March 15th, 1985. Thank you.",
-    "response_b": "Perfect! I have recorded your date of birth. Is there anything else?"
+    "response_b": "Perfect! I have recorded your date of birth. Is there anything else I can help you with today?"
   }'
 ```
 
@@ -107,18 +201,22 @@ curl -X POST http://localhost:8000/api/compare \
 {
   "winner": "a",
   "comparison": {
-    "conciseness": { "winner": "a", "reasoning": "Response A is appropriately brief" },
-    "task_completion": { "winner": "tie", "reasoning": "Both confirm the DOB" },
-    ...
+    "conciseness":     { "winner": "a", "reasoning": "A is appropriately brief; B adds unnecessary filler" },
+    "task_completion": { "winner": "tie", "reasoning": "Both confirm the DOB accurately" },
+    "naturalness":     { "winner": "a", "reasoning": "A sounds more natural for voice" },
+    "empathy":         { "winner": "tie", "reasoning": "Neither requires emotional attunement here" },
+    "safety":          { "winner": "tie", "reasoning": "Both are safe" },
+    "clarity":         { "winner": "a", "reasoning": "A is clearer when spoken aloud" }
   },
-  "recommendation": "Response A is preferred for concise verification scenarios"
+  "recommendation": "Prefer Response A for concise verification — avoid filler phrases in voice contexts."
 }
 ```
 
 ---
 
 ### `POST /api/improve`
-Generates an improved version of a response and scores both.
+
+Identifies weak dimensions (score < 8) and rewrites the response targeting those specifically.
 
 ```bash
 curl -X POST http://localhost:8000/api/improve \
@@ -135,23 +233,94 @@ curl -X POST http://localhost:8000/api/improve \
 **Response:**
 ```json
 {
-  "original_score": 5.5,
-  "improved_response": "That's a fair question. This survey helps us see if there are resources in your community that might help you — things like food assistance or transportation. Everything you share stays confidential.",
-  "improved_score": 8.2,
-  "changes_made": ["Added empathetic framing", "Explained purpose in plain language", "Added confidentiality assurance"]
+  "original_score": 5.2,
+  "improved_response": "That is a fair question. This survey helps us understand if there are any local resources — like food assistance or transportation — that could make a difference for you. Everything you share stays private.",
+  "improved_score": 8.7,
+  "changes_made": [
+    "Validated the user's concern with 'That is a fair question'",
+    "Replaced clinical jargon (SDOH protocol) with plain-language explanation",
+    "Added confidentiality assurance to reduce hesitation"
+  ]
 }
 ```
 
 ---
 
-### `POST /api/evaluate/calibrate` *(Bonus)*
-Runs the same evaluation N times to measure scoring consistency. `std_dev < 0.5` = well-calibrated.
+### `POST /api/evaluate/calibrate`
+
+Runs the same evaluation N times (bypassing cache) to measure scoring consistency. `std_dev < 0.5` = well-calibrated judge.
 
 ```bash
 curl -X POST "http://localhost:8000/api/evaluate/calibrate?runs=3" \
   -H "Content-Type: application/json" \
-  -d '{ "context": { ... }, "response": "..." }'
+  -d '{
+    "context": {
+      "current_directive": "Ask about food security",
+      "user_input": "We sometimes run out of food before the end of the month"
+    },
+    "response": "I understand that can be really challenging. Would you say that happens often, sometimes, or rarely?"
+  }'
 ```
+
+**Response:**
+```json
+{
+  "runs": 3,
+  "scores": [8.5, 8.7, 8.3],
+  "mean": 8.50,
+  "std_dev": 0.20,
+  "consistent": true
+}
+```
+
+`runs` accepts 2–5 (default: 3).
+
+---
+
+### `GET /api/analysis/patterns`
+
+Returns aggregated score trends across all persisted evaluations, grouped by `agent_id`, `prompt_version`, or `call_purpose`. Evaluations are written to SQLite on every non-cached `/api/evaluate` call.
+
+```bash
+# Group by agent
+curl "http://localhost:8000/api/analysis/patterns?group_by=agent_id"
+
+# Group by prompt version
+curl "http://localhost:8000/api/analysis/patterns?group_by=prompt_version"
+
+# Group by call purpose
+curl "http://localhost:8000/api/analysis/patterns?group_by=call_purpose"
+```
+
+**Response:**
+```json
+{
+  "group_by": "agent_id",
+  "patterns": [
+    {
+      "group_value": "food_security_agent",
+      "count": 47,
+      "mean_overall": 7.83,
+      "dimension_means": {
+        "task_completion": 8.1,
+        "empathy": 7.1,
+        "conciseness": 8.4,
+        "naturalness": 7.9,
+        "safety": 9.2,
+        "clarity": 8.0
+      }
+    },
+    {
+      "group_value": "intake_agent",
+      "count": 31,
+      "mean_overall": 8.21,
+      "dimension_means": { ... }
+    }
+  ]
+}
+```
+
+Use this to compare prompt versions (`v1` vs `v2`) or identify which agent type consistently underperforms on `empathy` or `task_completion`.
 
 ---
 
@@ -160,46 +329,62 @@ curl -X POST "http://localhost:8000/api/evaluate/calibrate?runs=3" \
 | Dimension | Description |
 |---|---|
 | `task_completion` | Did the response accomplish the directive? |
-| `empathy` | Appropriate emotional attunement to user's state? |
+| `empathy` | Appropriate emotional attunement to the user's state? |
 | `conciseness` | Efficient without being curt or robotic? |
-| `naturalness` | Sounds like natural spoken conversation? |
+| `naturalness` | Sounds like natural spoken conversation (not text)? |
 | `safety` | No harmful, biased, or inappropriate content? |
 | `clarity` | Easy to understand when spoken aloud? |
+
+Scale: `1–3` poor · `4–5` below average · `6` average · `7` good · `8` very good · `9` excellent · `10` perfect
 
 ---
 
 ## Design Decisions
 
-**Configurable LLM judge — defaults to `claude-sonnet-4-6`**
-The judge model is set via the `JUDGE_MODEL` env var. Sonnet is the default for production-quality scoring. Switch to `claude-haiku-4-5-20251001` for fast, cheap development iteration — same JSON schema, ~12x cheaper. See [EVAL_COMPARISON.md](EVAL_COMPARISON.md) for a full benchmark comparing both models across all evaluation metrics.
+**Configurable judge model via `JUDGE_MODEL`**
+Sonnet is the default for its largest discrimination gap between good and bad responses (+4.0 on the empathy failure case). Haiku is 12x cheaper for development. Opus achieves perfect calibration (`std_dev=0.00`) for high-stakes clinical contexts. See [EVAL_COMPARISON.md](EVAL_COMPARISON.md) for full benchmark results.
 
-**In-memory cache keyed by MD5(directive + user_input + response)**
-Identical requests return instantly without re-billing. The cache is intentionally bypassed in the `/calibrate` endpoint to measure true consistency. In production this would be Redis with a TTL.
+**In-memory MD5 cache**
+Identical `(directive, user_input, response)` tuples return instantly with `"cached": true` and zero API cost. Cache is intentionally bypassed in `/calibrate`. In production this would be Redis with a configurable TTL.
+
+**SQLite persistence (stdlib, auto-created)**
+Every fresh evaluation is written to `evaluations.db` with full dimension scores and metadata. No installation or migration needed — `sqlite3` is Python stdlib. The file is gitignored; each deployment builds its own history.
+
+**Non-English detection (pre-flight, no LLM cost)**
+`langdetect` identifies the response language before the LLM call. Non-English responses are flagged (e.g. `non_english_response:es`) without consuming tokens. Falls back silently if the text is too short to classify reliably.
+
+**Anchored scoring scale**
+The system prompt explicitly anchors: `5=average, 7=good, 9=excellent, 10=perfect`. Without this, LLMs default to clustering scores in the 7–9 range (leniency bias), reducing useful signal.
 
 **Markdown fence stripping**
-Even with explicit "no fences" instructions, the model occasionally wraps JSON in triple backticks. `_strip_fences()` handles this defensively before `json.loads`.
+Even with explicit "no fences" instructions, the model occasionally wraps JSON in triple backticks. `_strip_fences()` strips these before `json.loads`, preventing production parse failures.
 
-**Pre-flight flag detection**
-Empty and overly-long responses are flagged client-side before the LLM call, avoiding wasted tokens on trivially bad inputs.
+**Weak-dimension targeting in `/improve`**
+Dimensions scoring below 8 are identified and passed explicitly to the improvement prompt. This produces focused rewrites rather than generic "make it better" instructions.
 
-**Improvement uses weak-dimension targeting**
-The `/improve` endpoint identifies dimensions scoring below 8 and passes them explicitly to the improvement prompt. This focuses the rewrite rather than asking for generic improvement.
+**Separate system prompts for judge and improver**
+`EVAL_SYSTEM` (objective scorer) and `IMPROVE_SYSTEM` (empathetic rewriter) are kept separate to prevent role confusion. Mixing them in a single prompt degrades both tasks.
 
----
+**Tie is a first-class comparison outcome**
+The `/compare` prompt explicitly lists `"a"`, `"b"`, and `"tie"` as valid per-dimension and overall winners. Tie is not a fallback — it is the correct output when both responses are genuinely equivalent on a dimension (e.g. both confirm a DOB accurately → `task_completion: tie`). This prevents forcing a false winner and makes recommendations more honest.
 
-## What I'd Improve With More Time
-
-1. **Persistent cache** — Replace the in-memory dict with SQLite or Redis so scores survive restarts and can be queried for analytics.
-2. **Scoring patterns dashboard** — Aggregate scores by `agent_id`, `prompt_version`, and `call_purpose` to surface which prompt variants consistently underperform.
-3. **Structured output via Anthropic's tool-use** — Use `tool_use` / JSON schema enforcement instead of prompt-based JSON to eliminate parse errors entirely.
-4. **Cost optimization** — Batch multiple evaluations into a single LLM call using multi-turn context when evaluating a dataset.
-5. **Non-English handling** — Detect language and route to a multilingual model or flag for human review.
+**Error handling**
+All endpoints wrap handler logic in `try/except` and raise `HTTPException(500)` with the error detail. FastAPI's request validation layer returns `422` automatically for malformed payloads before the handler is reached. The five-file architecture (`models.py` → schemas, `judge.py` → LLM logic, `store.py` → persistence, `main.py` → routing, `sample_data.py` → fixtures) keeps each concern isolated and independently testable.
 
 ---
 
 ## Assumptions
 
-- All responses are short voice AI utterances (< ~150 words). Longer responses are flagged but still evaluated.
-- The 6 evaluation dimensions are fixed; production would allow dimension sets to be configured per agent type.
-- `overall_score` is a simple mean across all 6 dimensions (equal weight). A weighted average could be added per use case.
-- The `/improve` endpoint always makes 2–3 LLM calls. In a high-volume setting, improvement generation would be async.
+- All responses are short voice utterances. The 500-character flag reflects this — responses that length take ~30 seconds to speak, which is too long for voice AI.
+- `overall_score` is an unweighted mean across all 6 dimensions. In production, `empathy` and `safety` should carry higher weight for healthcare contexts.
+- The in-memory cache resets on server restart. This is intentional for a prototype — production would use Redis with a TTL.
+- The judge is validated against 3 provided sample cases. A production deployment would need a larger golden set for precision/recall scoring.
+
+---
+
+## What I'd Improve With More Time
+
+1. **Weighted dimension scoring** — `empathy` and `safety` should weigh more in healthcare. A per-agent-type weight configuration (e.g. receptionist vs survey agent) would let teams tune the evaluator to their context.
+2. **Multi-pass improvement loop** — The `/improve` endpoint does a single rewrite. If the improved score is still below a threshold (e.g. 7.0), it should iterate until the threshold is met or a max-iteration limit is reached.
+3. **Structured output via tool use** — Use Anthropic's `tool_use` / JSON schema enforcement instead of prompting for JSON. This eliminates `_strip_fences()` and makes parse failures structurally impossible.
+4. **Golden set validation** — Build a curated set of 50+ response pairs with known ground-truth rankings and run the judge against them to produce a precision/recall score.

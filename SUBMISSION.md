@@ -212,16 +212,16 @@ Sonnet's delta is highest (+4.4) because its starting score was lowest (4.3) —
 - 5-file architecture: `models.py` (schemas), `judge.py` (LLM logic), `main.py` (routing), `sample_data.py`, `benchmark.py`
 - All endpoints wrapped in `try/except` with proper `HTTPException` responses
 - `uv` + `pyproject.toml` for fully reproducible dependency management
-- 11 tests covering: happy path, caching, batch, edge cases (empty/long), comparison, improvement
+- 14 tests covering: happy path, caching, batch, edge cases (empty/long/non-English), comparison, improvement, SQLite persistence, pattern analysis
 
 ### Additional Points
 
 | Bonus | Implementation |
 |---|---|
 | Calibration | `/api/evaluate/calibrate` — runs N independent evals, returns mean, std dev, and `consistent` flag |
-| Edge cases | Empty responses flagged pre-LLM (`empty_response`); >500 char responses flagged (`response_too_long_for_voice`) |
-| Cost optimisation | MD5-keyed in-memory cache (zero cost on repeat); Haiku for dev / Sonnet for prod via env var; batch endpoint reduces overhead |
-| Scoring pattern analysis | `dimension_means` in batch aggregate; `benchmark.py` produces cross-model comparison report |
+| Edge cases | Empty responses flagged pre-LLM (`empty_response`); >500 char responses flagged (`response_too_long_for_voice`); non-English detected via `langdetect` and flagged (`non_english_response:<lang>`) |
+| Cost optimisation | MD5-keyed in-memory cache (zero cost on repeat); Haiku for dev / Sonnet for prod via env var; batch endpoint reduces per-request overhead |
+| Scoring pattern analysis | SQLite persistence (`evaluations.db`, auto-created) stores every evaluation with `agent_id`, `prompt_version`, `call_purpose`; `/api/analysis/patterns?group_by=agent_id` returns aggregated dimension scores per group |
 
 ---
 
@@ -240,8 +240,8 @@ Sonnet's delta is highest (+4.4) because its starting score was lowest (4.3) —
 
 2. **Multi-pass improvement loop** — The `/improve` endpoint does a single rewrite pass. If the improved score is still below a threshold (e.g. 7.0), it should iterate with the new score and feedback until the threshold is met or a max-iteration limit is reached.
 
-3. **Persistent cache + scoring analytics** — Swap the in-memory dict for SQLite/Redis. Store scores by `agent_id`, `prompt_version`, and `call_purpose` to build a time-series view of which prompt versions are improving or degrading.
+3. **Structured output via tool use** — Use Anthropic's `tool_use` / JSON schema enforcement instead of prompting for JSON. This eliminates the need for `_strip_fences()` and makes parse failures structurally impossible.
 
-4. **Structured output via tool use** — Use Anthropic's `tool_use` / JSON schema enforcement instead of prompting for JSON. This eliminates the need for `_strip_fences()` and makes parse failures structurally impossible.
+4. **Golden set validation** — Build a curated set of 50+ response pairs with known ground-truth quality rankings, and run the judge against them to produce a precision/recall score. This makes the evaluator itself auditable.
 
-5. **Golden set validation** — Build a curated set of 50+ response pairs with known ground-truth quality rankings, and run the judge against them to produce a precision/recall score. This makes the evaluator itself auditable.
+5. **Redis cache with TTL** — Replace the in-memory dict with Redis so the cache survives restarts and can be shared across multiple server instances in production.

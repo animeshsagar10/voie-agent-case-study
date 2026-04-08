@@ -201,3 +201,66 @@ def test_improve_increases_score():
     assert data["improved_score"] >= data["original_score"], (
         f"Improved score ({data['improved_score']}) should be >= original ({data['original_score']})"
     )
+
+
+# ── Non-English detection ──────────────────────────────────────────────────────
+
+def test_evaluate_flags_non_english_response():
+    """A clearly non-English response should be flagged as non_english_response."""
+    payload = {
+        "context": SAMPLE_CASES[0]["context"],
+        "response": "Lo siento, no puedo ayudarte con eso en este momento.",  # Spanish
+    }
+    r = client.post("/api/evaluate", json=payload)
+    assert r.status_code == 200
+    flags = r.json()["flags"]
+    non_english_flags = [f for f in flags if f.startswith("non_english_response")]
+    assert len(non_english_flags) == 1, f"Expected non_english_response flag, got flags: {flags}"
+
+
+# ── SQLite persistence + /api/analysis/patterns ────────────────────────────────
+
+def test_patterns_endpoint_structure():
+    """
+    Submit an evaluation with agent_id metadata, then verify /api/analysis/patterns
+    returns the correct structure and includes the submitted agent.
+    """
+    # Submit a fresh eval with a distinctive agent_id so it lands in the DB
+    import uuid
+    agent_id = f"test_agent_{uuid.uuid4().hex[:8]}"
+    payload = {
+        "context": SAMPLE_CASES[0]["context"],
+        "response": SAMPLE_CASES[0]["response_good"],
+        "metadata": {"agent_id": agent_id, "prompt_version": "v1", "call_purpose": "unit_test"},
+    }
+    # Clear in-memory cache so this forced a real eval (and a DB write)
+    import judge as _judge
+    _judge._cache.clear()
+
+    eval_r = client.post("/api/evaluate", json=payload)
+    assert eval_r.status_code == 200
+    assert eval_r.json()["cached"] is False  # must be a fresh write
+
+    # Now check patterns
+    r = client.get("/api/analysis/patterns", params={"group_by": "agent_id"})
+    assert r.status_code == 200
+    data = r.json()
+
+    assert data["group_by"] == "agent_id"
+    assert isinstance(data["patterns"], list)
+    assert len(data["patterns"]) >= 1
+
+    # Our agent_id should appear
+    agent_entries = [p for p in data["patterns"] if p["group_value"] == agent_id]
+    assert len(agent_entries) == 1
+    entry = agent_entries[0]
+
+    assert entry["count"] >= 1
+    assert 1.0 <= entry["mean_overall"] <= 10.0
+    expected_dims = {"task_completion", "empathy", "conciseness", "naturalness", "safety", "clarity"}
+    assert set(entry["dimension_means"].keys()) == expected_dims
+
+
+def test_patterns_invalid_group_by_returns_400():
+    r = client.get("/api/analysis/patterns", params={"group_by": "invalid_field"})
+    assert r.status_code == 422  # FastAPI validates the Query pattern before our handler

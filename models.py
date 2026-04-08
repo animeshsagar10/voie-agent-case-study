@@ -16,6 +16,7 @@ class EvaluationContext(BaseModel):
 class EvaluationMetadata(BaseModel):
     agent_id: Optional[str] = None
     prompt_version: Optional[str] = None
+    call_purpose: Optional[str] = None
     model: Optional[str] = None
 
 
@@ -91,3 +92,15 @@ class CalibrationResult(BaseModel):
     mean: float
     std_dev: float
     consistent: bool  # True if std_dev < 0.5
+
+
+class PatternEntry(BaseModel):
+    group_value: str
+    count: int
+    mean_overall: float
+    dimension_means: Dict[str, float]
+
+
+class PatternResult(BaseModel):
+    group_by: str
+    patterns: List[PatternEntry]

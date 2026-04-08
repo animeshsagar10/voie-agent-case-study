@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 import judge
+import store
 from models import (
     AggregateStats,
     BatchEvaluateRequest,
@@ -16,6 +17,8 @@ from models import (
     EvaluationResult,
     ImproveRequest,
     ImproveResult,
+    PatternEntry,
+    PatternResult,
 )
 
 app = FastAPI(
@@ -41,7 +44,7 @@ def health():
 def evaluate(request: EvaluateRequest):
     """Evaluate a single voice AI response across 6 quality dimensions."""
     try:
-        return judge.evaluate_response(request.context, request.response)
+        return judge.evaluate_response(request.context, request.response, metadata=request.metadata)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -53,7 +56,8 @@ def evaluate_batch(request: BatchEvaluateRequest):
         raise HTTPException(status_code=400, detail="evaluations list cannot be empty")
     try:
         results = [
-            judge.evaluate_response(r.context, r.response) for r in request.evaluations
+            judge.evaluate_response(r.context, r.response, metadata=r.metadata)
+            for r in request.evaluations
         ]
 
         overall_scores = [r.overall_score for r in results]
@@ -106,6 +110,30 @@ def calibrate(request: EvaluateRequest, runs: int = Query(default=3, ge=2, le=5)
     """
     try:
         return judge.calibrate_response(request.context, request.response, runs=runs)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/analysis/patterns", response_model=PatternResult)
+def analysis_patterns(
+    group_by: str = Query(
+        default="agent_id",
+        description="Group evaluations by: agent_id | prompt_version | call_purpose",
+        pattern="^(agent_id|prompt_version|call_purpose)$",
+    )
+):
+    """
+    Bonus: Aggregated score trends grouped by agent_id, prompt_version, or call_purpose.
+    Evaluations are persisted to evaluations.db on every /api/evaluate call.
+    """
+    try:
+        patterns = store.get_patterns(group_by)
+        return PatternResult(
+            group_by=group_by,
+            patterns=[PatternEntry(**p) for p in patterns],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
