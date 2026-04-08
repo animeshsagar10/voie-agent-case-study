@@ -365,6 +365,9 @@ Dimensions scoring below 8 are identified and passed explicitly to the improveme
 **Separate system prompts for judge and improver**
 `EVAL_SYSTEM` (objective scorer) and `IMPROVE_SYSTEM` (empathetic rewriter) are kept separate to prevent role confusion. Mixing them in a single prompt degrades both tasks.
 
+**Prompt design and update flow**
+System prompts are hardcoded constants in `judge.py`. User prompts are assembled dynamically per request — `evaluate_response`, `compare_responses`, and `improve_response` each build a prompt string from the live context (directive, user input, response text) and specify the exact JSON schema to return. To update a prompt today: edit the constant in `judge.py` and restart the server. There is no versioning or hot-reload — see *What I'd Improve* below.
+
 **Tie is a first-class comparison outcome**
 The `/compare` prompt explicitly lists `"a"`, `"b"`, and `"tie"` as valid per-dimension and overall winners. Tie is not a fallback — it is the correct output when both responses are genuinely equivalent on a dimension (e.g. both confirm a DOB accurately → `task_completion: tie`). This prevents forcing a false winner and makes recommendations more honest.
 
@@ -388,3 +391,4 @@ All endpoints wrap handler logic in `try/except` and raise `HTTPException(500)` 
 2. **Multi-pass improvement loop** — The `/improve` endpoint does a single rewrite. If the improved score is still below a threshold (e.g. 7.0), it should iterate until the threshold is met or a max-iteration limit is reached.
 3. **Structured output via tool use** — Use Anthropic's `tool_use` / JSON schema enforcement instead of prompting for JSON. This eliminates `_strip_fences()` and makes parse failures structurally impossible.
 4. **Golden set validation** — Build a curated set of 50+ response pairs with known ground-truth rankings and run the judge against them to produce a precision/recall score.
+5. **Prompt registry with versioning** — Externalise `EVAL_SYSTEM` and `IMPROVE_SYSTEM` into a config (YAML or DB) keyed by version. `/api/evaluate` would then select the prompt matching the caller's `prompt_version`, making the `/api/analysis/patterns` endpoint genuinely useful for comparing `v1` vs `v2` prompt performance. Currently `prompt_version` is caller-supplied metadata — it is not tied to the actual prompt text used.
